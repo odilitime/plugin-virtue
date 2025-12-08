@@ -1,0 +1,47 @@
+{
+  "name": "@elizaos/plugin-virtue",
+  "version": "0.1.0",
+  "description": "Benjamin Franklin's Virtue Tracker - gamified self-improvement plugin",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "packageType": "plugin",
+  "platform": "node",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "package.json"
+  ],
+  "dependencies": {
+    "@elizaos/core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  },
+  "scripts": {
+    "build": "bun run build.ts",
+    "dev": "bun run build.ts --watch",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "plugin",
+    "elizaos",
+    "virtue",
+    "gamification",
+    "self-improvement"
+  ],
+  "author": "",
+  "license": "MIT"
+}
+
