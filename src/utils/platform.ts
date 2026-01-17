@@ -9,9 +9,9 @@
  * Design Decisions:
  * 1. Why string matching on message.content.source
  *    - Simple and reliable
- *    - Source is set by ElizaOS client adapters
+ *    - Source is set by elizaOS client adapters
  *    - Alternative: Enum or constant
- *    - Rejected: Would require changes to ElizaOS core
+ *    - Rejected: Would require changes to elizaOS core
  * 
  * 2. Why 'unknown' fallback
  *    - Graceful degradation if platform unrecognized
@@ -39,7 +39,7 @@ export type Platform = 'discord' | 'telegram' | 'twitter' | 'unknown';
  * - Source might be 'discord-client' or 'telegram-bot'
  * - Flexible matching handles variations
  * 
- * @param message - ElizaOS message object
+ * @param message - elizaOS message object
  * @returns Platform identifier or 'unknown'
  */
 export function getPlatform(message: Memory): Platform {

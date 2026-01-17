@@ -4,6 +4,7 @@ import { VirtueService } from '../services/virtueService';
 export const virtueProvider: Provider = {
   name: 'VIRTUE_CONTEXT',
   description: 'Provides virtue tracking context for the agent',
+  dynamic: true,
   
   get: async (
     runtime: IAgentRuntime,

@@ -74,7 +74,7 @@ async function ensureRepeatingTask(
 ): Promise<void> {
   try {
     const existingTasks = await runtime.getTasksByName(taskName);
-    
+
     // Only create if doesn't exist - prevents duplicates on plugin reload
     if (existingTasks.length === 0) {
       await runtime.createTask({
@@ -86,7 +86,7 @@ async function ensureRepeatingTask(
           updateInterval: options.updateInterval
         }
       });
-      
+
       runtime.logger.info({ src: 'plugin:virtue', taskName }, 'Created repeating virtue task');
     }
   } catch (error) {
@@ -117,15 +117,15 @@ async function ensureRepeatingTask(
 export const virtuePlugin: Plugin = {
   name: '@elizaos/plugin-virtue',
   description: "Benjamin Franklin's Virtue Tracker - gamified self-improvement plugin",
-  
+
   /**
    * Why depend on bootstrap:
    * - We need TaskService for periodic tasks (rule refinement, community reports)
    * - Bootstrap provides the task scheduling infrastructure
    * - Alternative would be setInterval, but TaskService persists across restarts
    */
-  dependencies: ['bootstrap'],
-  
+  dependencies: ['@elizaos/plugin-bootstrap'],
+
   async init(_config: Record<string, string>, runtime: IAgentRuntime) {
     try {
       printBanner({
@@ -135,7 +135,7 @@ export const virtuePlugin: Plugin = {
       });
 
       runtime.logger.info({ src: 'plugin:virtue', agentId: runtime.agentId }, 'Initializing virtue plugin');
-      
+
       /**
        * Step 1: Register task workers
        * 
@@ -147,7 +147,7 @@ export const virtuePlugin: Plugin = {
       runtime.registerTaskWorker(ruleRefinementWorker);
       runtime.registerTaskWorker(communityReportWorker);
       runtime.registerTaskWorker(dailyReminderWorker);
-      
+
       /**
        * Step 2: Initialize detection rules
        * 
@@ -161,9 +161,9 @@ export const virtuePlugin: Plugin = {
         await runtime.setCache(CACHE_KEYS.RULES(runtime.agentId), INITIAL_DETECTION_RULES);
         runtime.logger.debug({ src: 'plugin:virtue' }, 'Initialized detection rules');
       }
-      
+
       /**
-       * Step 3: Create repeating tasks
+       * Step 3: Create repeating tasks (deferred until database is ready)
        * 
        * Why these specific intervals:
        * - 24 hours for rule refinement: Daily is frequent enough to adapt but not spam LLM
@@ -172,17 +172,30 @@ export const virtuePlugin: Plugin = {
        * Why use 'repeat' tag:
        * - TaskService automatically re-queues tasks with 'repeat' tag after execution
        * - updateInterval in metadata tells TaskService when to run next
+       * 
+       * Why use .then() instead of await:
+       * - Plugin init must complete for runtime init to finish (avoid deadlock)
+       * - Database adapter may not be ready during plugin init phase
        */
-      await ensureRepeatingTask(runtime, 'VIRTUE_RULE_REFINEMENT', {
-        updateInterval: 24 * 60 * 60 * 1000, // 24 hours
-        description: 'Refine virtue detection rules via LLM'
+      runtime.initPromise.then(async () => {
+        try {
+          await ensureRepeatingTask(runtime, 'VIRTUE_RULE_REFINEMENT', {
+            updateInterval: 24 * 60 * 60 * 1000, // 24 hours
+            description: 'Refine virtue detection rules via LLM'
+          });
+
+          await ensureRepeatingTask(runtime, 'VIRTUE_COMMUNITY_REPORT', {
+            updateInterval: 7 * 24 * 60 * 60 * 1000, // 7 days
+            description: 'Generate weekly community virtue insights'
+          });
+        } catch (error) {
+          runtime.logger.warn({
+            src: 'plugin:virtue',
+            error: error instanceof Error ? error.message : String(error)
+          }, 'Failed to create repeating tasks (non-fatal)');
+        }
       });
-      
-      await ensureRepeatingTask(runtime, 'VIRTUE_COMMUNITY_REPORT', {
-        updateInterval: 7 * 24 * 60 * 60 * 1000, // 7 days
-        description: 'Generate weekly community virtue insights'
-      });
-      
+
       runtime.logger.info({ src: 'plugin:virtue', agentId: runtime.agentId }, 'Virtue plugin initialized successfully');
     } catch (error) {
       runtime.logger.error({
@@ -193,7 +206,7 @@ export const virtuePlugin: Plugin = {
       throw error;
     }
   },
-  
+
   /**
    * Services: 8 total
    * 
@@ -210,16 +223,16 @@ export const virtuePlugin: Plugin = {
    * Each service can be tested independently and has clear boundaries.
    */
   services: [
-    VirtueService, 
-    NotificationService, 
-    SeasonalEventsService, 
+    VirtueService,
+    NotificationService,
+    SeasonalEventsService,
     VirtueSynergyService,
     VirtueChallengeService,
     MentorshipService,
     HistoricalComparisonService,
     VirtueRemixService
   ],
-  
+
   /**
    * Actions: 19 total
    * 
@@ -258,7 +271,7 @@ export const virtuePlugin: Plugin = {
     awardBadgeAction,
     auditRulesAction
   ],
-  
+
   /**
    * Evaluators: 1 (virtueObserver)
    * 
@@ -274,7 +287,7 @@ export const virtuePlugin: Plugin = {
    * - Accuracy: Rule-based detection is sufficient with self-improvement
    */
   evaluators: [virtueObserverEvaluator],
-  
+
   /**
    * Providers: 1 (virtueProvider)
    * 

@@ -1,42 +1,54 @@
-# Plugin Virtue - Architecture & Design Decisions
+# Plugin Virtue – Architecture & Design Decisions
 
-This document explains **WHY** things are built the way they are in plugin-virtue.
+This document explains **WHY** things are built the way they are.
+
+---
 
 ## Table of Contents
+
 1. [Core Design Philosophy](#core-design-philosophy)
 2. [Data Architecture](#data-architecture)
-3. [Performance Optimization](#performance-optimization)
+3. [Detection System](#detection-system)
 4. [Gamification Balance](#gamification-balance)
 5. [Anti-Gaming Measures](#anti-gaming-measures)
 6. [Privacy & GDPR](#privacy--gdpr)
-7. [Future Scalability](#future-scalability)
+7. [Scalability](#scalability)
+8. [Code Organization](#code-organization)
 
 ---
 
 ## Core Design Philosophy
 
-### Why Rule-Based + LLM Hybrid Approach?
+### Why Hybrid Rule-Based + LLM?
 
 **Problem:** Need to detect virtuous behavior in every chat message.
 
-**Why not just LLM per message?**
-- ❌ Cost: $0.001-0.01 per message × 1000 messages/day = $1-10/day per server
-- ❌ Latency: 200-500ms per LLM call slows down message processing
-- ❌ Rate limits: Would hit OpenAI rate limits quickly
+| Approach | Cost | Latency | Accuracy |
+|----------|------|---------|----------|
+| LLM per message | $1-10/day/server | 200-500ms | 95%+ |
+| Pure rules | $0 | <1ms | 80% |
+| **Hybrid** | ~$0.10/day | <1ms | 90%+ improving |
 
-**Why not just rule-based forever?**
-- ❌ Stale rules: Language evolves, new slang emerges
-- ❌ Community-specific: Different servers have different communication styles
-- ❌ Edge cases: Sarcasm, context, nuance hard to capture in regex
+**Solution:**
+- Rule-based detection on every message (fast, cheap)
+- Daily LLM task refines rules based on outcomes (self-improving)
 
-**Solution: Hybrid System**
-- ✅ Rule-based detection on every message (fast, cheap, 99% accuracy)
-- ✅ Daily LLM task refines rules based on recent messages (self-improving)
-- ✅ Best of both worlds: Performance + adaptability
+**Files:**
+- `evaluators/virtueObserver.ts` – Rule-based detection
+- `tasks/ruleRefinementWorker.ts` – Daily LLM refinement
 
-**Implementation:**
-- `evaluators/virtueObserver.ts`: Rule-based detection (runs on every message)
-- `tasks/ruleRefinementWorker.ts`: LLM refinement (runs once per 24 hours)
+### Why Bootstrap Dependency?
+
+The plugin depends on `@elizaos/plugin-bootstrap` for `TaskService`:
+
+- Provides infrastructure for repeating tasks
+- Handles task scheduling and execution
+- Avoids reinventing task management
+
+**Initialization order:**
+1. Register task workers (names must exist before tasks reference them)
+2. Initialize detection rules (if not exist)
+3. Create repeating tasks (rule refinement: 24h, community report: 7d)
 
 ---
 
@@ -46,117 +58,89 @@ This document explains **WHY** things are built the way they are in plugin-virtu
 
 **Decision:** Use `runtime.getCache/setCache` instead of database tables.
 
-**Pros:**
-- ✅ Simple: No schema migrations, no ORM complexity
-- ✅ Fast: In-memory reads/writes
-- ✅ Sufficient: Works well for 100-1000 users per world
-- ✅ ElizaOS pattern: Matches how other plugins work
+| Factor | Cache | Database |
+|--------|-------|----------|
+| Complexity | Simple | Schema migrations |
+| Speed | In-memory | Network latency |
+| Scale limit | ~1000 users | Millions |
+| Queries | Key-value only | SQL joins |
 
-**Cons:**
-- ❌ Not for millions of users (would need Redis/PostgreSQL)
-- ❌ Harder to query across users (no SQL)
-- ❌ Memory limits (1-10MB per user × 1000 users = 1-10GB)
+**When to migrate:** >5000 users, complex analytics needed, memory >10GB.
 
-**When to migrate to database:**
-- Server has >5000 active users
-- Need complex queries (e.g., "top 100 users in US who practiced humility this week")
-- Need multi-server leaderboards
-- Running out of memory
+### Cache Key Schema
 
-**Migration path:**
-- Create `VirtueAdapter` interface
-- Implement `CacheVirtueAdapter` (current) and `DatabaseVirtueAdapter`
-- Swap implementations without changing business logic
-
-### Cache Key Design
-
-```typescript
-// User data (versioned for future migrations)
-`virtue:user:v1:${entityId}`
-
-// Leaderboard per world (isolated communities)
-`virtue:leaderboard:${worldId}`
-
-// Detection rules per agent (each agent learns independently)
-`virtue:rules:${agentId}`
-
-// Cooldowns per user (prevent spam)
-`virtue:cooldown:${entityId}`
+```
+virtue:user:v1:${entityId}        # User data (versioned for migration)
+virtue:leaderboard:${worldId}     # Per-world rankings
+virtue:rules:${agentId}           # Detection rules (per-agent learning)
+virtue:cooldown:${entityId}       # Observation cooldowns
+virtue:privacy:${entityId}        # Privacy settings
+virtue:mentorship:${worldId}      # Mentor-mentee pairs
+virtue:challenges:${worldId}      # Active challenges
 ```
 
 **Why versioned keys (`:v1:`)?**
-- Enables data migrations without breaking existing users
-- Change data structure in v2, read v1 and migrate on-demand
-- Gradual rollout of new features
+- Enables schema migrations without breaking existing users
+- Change structure in v2, read v1 and migrate on-demand
 
 **Why per-world leaderboards?**
 - Each Discord server is a separate community
 - Prevents one mega-community from dominating
-- Allows fair competition within peer groups
 
 **Why per-agent rules?**
-- Each agent instance learns from its own community
-- Rules adapt to community communication style
-- No cross-contamination between servers
+- Each agent learns from its own community
+- Rules adapt to communication style
 
 ---
 
-## Performance Optimization
+## Detection System
 
-### Cooldown System
-
-**Problem:** Without cooldowns, one user could spam virtuous behavior and get 100 awards per day.
-
-**Solution:** Max 1 observed award per user per hour.
+### Rule Structure
 
 ```typescript
-// Check cooldown before awarding
-const cooldown = await runtime.getCache(`virtue:cooldown:${entityId}`);
-if (cooldown && Date.now() - cooldown < 60 * 60 * 1000) {
-  return; // Skip silently
+interface VirtueDetectionRule {
+  virtueId: string;
+  keywords: string[];        // Simple phrases to match
+  excludePatterns: string[]; // Filter out gaming attempts
+  contextClues: string[];    // 'isReply', 'mentionsOther'
+  confidence: number;        // 0.3 - 0.9
 }
-
-// Award virtue, set new cooldown
-await awardObservedVirtue(...);
-await runtime.setCache(`virtue:cooldown:${entityId}`, Date.now());
 ```
 
-**Why 1 hour?**
-- ✅ Prevents gaming (can't farm points by spamming "sorry" 100 times)
-- ✅ Still allows multiple awards per day (24 potential awards)
-- ✅ Feels natural (real virtuous actions are spaced out)
+**Why simple keywords (no regex)?**
+- LLM can safely add/remove keywords
+- No risk of ReDoS attacks
+- Easy to audit and understand
 
-**Why not per-virtue cooldown?**
-- Simpler implementation
-- User could still game by cycling through 13 virtues (13 awards per hour)
-- Per-user cooldown is more robust
+**Why exclude patterns?**
+- Prevents "I am so humble" gaming
+- Filters self-referential claims
+- Real virtue is demonstrated, not claimed
 
-### Leaderboard Updates
+### Confidence Calculation
 
-**Problem:** Recalculating leaderboard from scratch on every check-in is O(n × m) where n = users, m = days.
-
-**Solution:** Incremental updates.
-
-```typescript
-// On check-in, update just this user's entry
-await updateLeaderboard(worldId, entityId, newPoints, streak, badges);
-
-// Inside updateLeaderboard:
-// 1. Find user's entry (O(n))
-// 2. Update their points
-// 3. Re-sort (O(n log n))
-// 4. Trim to top 100 (O(1))
+```
+confidence = base_confidence × (1 + 0.1 × extra_matches)
 ```
 
-**Why top 100 only?**
-- UI can't display 1000 users anyway
-- Reduces memory footprint
-- Faster sorts
-- Users care about top 10, maybe top 50
+**Why this formula?**
+- Multiple keyword matches increase confidence
+- Caps at 0.95 to never be "certain"
+- Base confidence from rule (0.3-0.9)
 
-**When this breaks:**
-- >10,000 users per world (sorting becomes slow)
-- Solution: Move to database with indexed queries
+### Rule Refinement Process
+
+1. Fetch current rules
+2. Collect recent detection outcomes (7 days)
+3. LLM analyzes accuracy, proposes changes
+4. Validate proposals (no regex, reasonable values)
+5. Apply safe changes to rules
+6. Log changelog for audit
+
+**Constraints on LLM changes:**
+- Add/remove keywords only (simple strings)
+- Adjust confidence (0.3-0.9 range)
+- No new virtues, no regex patterns
 
 ---
 
@@ -164,108 +148,95 @@ await updateLeaderboard(worldId, entityId, newPoints, streak, badges);
 
 ### Point Economics
 
-**Base Values:**
-- Self-report: 10 points
-- Observed: 5 points
-- All-13 bonus: 50 points
-- Streak bonus: +1 point per day (capped at +50)
-
-**Why these values?**
-
-**Self-report > Observed:**
-- Self-reporting requires self-awareness (more valuable)
-- Observed is passive (user might not even know they did it)
-- 2:1 ratio encourages conscious practice
-
-**All-13 bonus = 50 points:**
-- Base for all-13: 13 × 10 = 130 points
-- With bonus: 180 points
-- ~38% bonus (significant but not overwhelming)
-- Makes completing all-13 feel special
-
-**Streak bonus capped at +50:**
-- Without cap: 365-day streak = +365 per check-in (broken)
-- With cap: Max +50 per check-in
-- Streak still valuable but not dominant
-- New users stay competitive
+| Source | Points | Rationale |
+|--------|--------|-----------|
+| Self-report | 10 | Requires self-awareness |
+| Observed | 5 | Passive, less valuable |
+| Streak/day | +5 | Habit reinforcement |
+| Streak cap | +50 | Prevents runaway inflation |
+| All-13 | +100 | ~38% bonus, feels special |
 
 **Monthly Earnings:**
-- Casual user (1 virtue/day × 30 days): 300-450 points
-- Engaged user (5 virtues/day + 7-day streak): 1,500-2,000 points
-- Hardcore user (all-13 daily + 30-day streak): 6,000-8,000 points
+- Casual (1/day): 300-450 pts
+- Engaged (5/day): 1,500-2,000 pts
+- Hardcore (all-13/day): 6,000-8,000 pts
 
-**Result:** 20x range between casual and hardcore. Enough to reward dedication without making casual players feel hopeless.
+**Result:** 20x range between casual and hardcore. Rewards dedication without making casual players feel hopeless.
 
 ### Badge Progression
 
-**Tiers:**
-1. Beginner (1 day) - Everyone gets this
-2. Week Warrior (7 days) - ~30% reach this
-3. Monthly Master (30 days) - ~10% reach this
-4. Year Veteran (365 days) - <1% reach this
+| Tier | Streak | % Reach |
+|------|--------|---------|
+| Beginner | 1 day | 100% |
+| Week Warrior | 7 days | ~30% |
+| Monthly Master | 30 days | ~10% |
+| Century Club | 100 days | ~3% |
+| Year of Virtue | 365 days | <1% |
 
 **Why this curve?**
-- Rapid early progression (1 day → 7 days)
-- Long-term goals for engaged users (30 → 365 days)
-- Most users earn 2-5 badges (feels achievable)
-- Hardcore users chase rare badges (365 days, all-13 in one day)
+- Rapid early progression hooks users
+- Long-term goals for engaged users
+- Most users earn 2-5 badges (achievable)
+
+### Synergy Design
+
+```typescript
+{
+  id: 'franklins_triangle',
+  virtues: ['humility', 'industry', 'frugality'],
+  bonus: 40  // Highest bonus - Franklin's favorites
+}
+```
+
+**Why 3-virtue combos?**
+- 2 is too easy (accidental)
+- 4+ is too hard (discouraging)
+- 3 requires intentional planning
 
 ---
 
 ## Anti-Gaming Measures
 
-### Self-Referential Claim Filtering
+### Self-Referential Filtering
 
-**Problem:** User could say "I am so humble" and farm humility points.
+**Problem:** User says "I am so humble" to farm points.
 
-**Solution:** Exclude patterns that reference the virtue itself.
+**Solution:** Exclude patterns filter self-claims:
 
 ```typescript
 excludePatterns: [
-  'i am humble',
-  'i practice humility',
-  'i was humble'
+  'i am humble', 'i practice humility', 'i was humble'
 ]
 ```
 
-**Why this works:**
-- Real humility: "my mistake" → counts
-- Fake humility: "i am humble" → filtered out
-- Based on virtue theory: True virtue is demonstrated, not claimed
+**Philosophy:** True virtue is demonstrated, not claimed.
 
-### Duplicate Check-In Handling
+### Duplicate Handling
 
-**Problem:** User could check in same virtue 10 times per day.
+| Scenario | Behavior |
+|----------|----------|
+| Self + Self same day | Positive message, no extra points |
+| Observed + Observed | Silent ignore |
+| Observed → Self | Upgrade (+5 pts difference) |
 
-**Solution:** Max 1 check-in per virtue per day.
-
-**Edge case:** Observed first, then self-report.
-
-```typescript
-// Morning: Agent observes user helping someone (5 pts)
-checkIn(entityId, 'justice', 'observed') // → 5 pts
-
-// Evening: User self-reports "helped someone today" (5 more pts)
-checkIn(entityId, 'justice', 'self-report') // → 5 pts (upgrade)
-
-// Total: 10 pts (not 15) - prevents double-dipping
-```
-
-**Why allow upgrade:**
+**Why allow upgrade?**
 - Rewards self-awareness after autonomous behavior
 - 10 pts total = same as pure self-report
-- Fair: User gets credit for both observation and conscious practice
+- Fair: credit for both observation and conscious practice
 
-### Cooldown for Observed Awards
+### Cooldown System
 
-**Problem:** User could trigger observation detection 100 times per day by repeating trigger phrases.
+**Rule:** Max 1 observed award per user per hour.
 
-**Solution:** Max 1 observed award per user per hour.
-
-**Why per-user (not per-virtue):**
-- User could cycle through 13 virtues (13 awards per hour)
+**Why per-user (not per-virtue)?**
+- User could cycle through 13 virtues (13 awards/hour)
 - Per-user is more robust
-- Simpler implementation (one cooldown key instead of 13)
+- Simpler implementation
+
+**Why 1 hour?**
+- Prevents gaming by spam
+- Still allows 24 potential awards/day
+- Real virtuous actions are spaced out
 
 ---
 
@@ -273,141 +244,152 @@ checkIn(entityId, 'justice', 'self-report') // → 5 pts (upgrade)
 
 ### Data Minimization
 
-**What we store:**
-- ✅ Check-in history (date + virtue + source + points)
-- ✅ Badges, streaks, timezone
-- ✅ Reminder preference
+**Stored:**
+- Check-in history (date + virtue + source + points)
+- Badges, streaks, timezone
+- Reminder preference
 
-**What we DON'T store:**
-- ❌ Message content
-- ❌ IP addresses
-- ❌ Personal information beyond entityId
+**NOT stored:**
+- Message content
+- IP addresses
+- Personal information beyond entityId
 
-### User Rights (GDPR Compliant)
+### User Rights
 
-**Right to Access:**
-```typescript
-// EXPORT_DATA action
-GET virtue:user:v1:${entityId}
-→ Returns JSON of all user data
-```
+| Right | Implementation |
+|-------|----------------|
+| Access | `EXPORT_DATA` action → JSON download |
+| Deletion | `DELETE_MY_DATA` → removes all cache keys |
+| Opt-out | `SET_PRIVACY` → disables observation |
 
-**Right to Deletion:**
-```typescript
-// DELETE_MY_DATA action
-DELETE virtue:user:v1:${entityId}
-DELETE virtue:cooldown:${entityId}
-DELETE virtue:privacy:${entityId}
-// Remove from leaderboard
-```
-
-**Right to Opt-Out:**
-```typescript
-// SET_PRIVACY action
-virtue:privacy:${entityId} = { optOutObservation: true }
-→ Evaluator skips this user
-```
-
-**Why separate privacy cache key:**
+**Why separate privacy cache key?**
 - Checked on every message (hot path)
 - Smaller data structure = faster reads
-- Can be cached in memory for performance
 
 ---
 
-## Future Scalability
+## Scalability
 
-### When to Migrate to Database
+### Current Limits
 
-**Current limits:**
 - ✅ Up to 1,000 users per world
 - ✅ Up to 10 worlds per agent
 - ✅ ~10MB per user × 10,000 users = 100GB (feasible)
 
-**Migrate to database when:**
-- Server has >5,000 active users
-- Need cross-world leaderboards
-- Need complex queries (analytics, reports)
-- Memory usage >10GB
-- Want to scale horizontally (multiple agent instances)
+### Database Migration Path
 
-### Database Schema (Future)
+When to migrate:
+- >5,000 active users
+- Need cross-world leaderboards
+- Complex analytics required
+- Memory >10GB
+
+**Future schema:**
 
 ```sql
--- Users table
 CREATE TABLE virtue_users (
   id UUID PRIMARY KEY,
   entity_id TEXT NOT NULL,
   world_id TEXT NOT NULL,
   timezone TEXT DEFAULT 'UTC',
-  total_points INTEGER DEFAULT 0,
-  reminder_enabled BOOLEAN DEFAULT false,
-  created_at TIMESTAMP DEFAULT NOW()
+  total_points INTEGER DEFAULT 0
 );
 
--- Check-ins table (partitioned by date for performance)
 CREATE TABLE virtue_checkins (
-  id UUID PRIMARY KEY,
   user_id UUID REFERENCES virtue_users(id),
   virtue_id TEXT NOT NULL,
-  source TEXT NOT NULL, -- 'self-report' or 'observed'
+  source TEXT NOT NULL,
   points INTEGER NOT NULL,
-  date DATE NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
+  date DATE NOT NULL
 ) PARTITION BY RANGE (date);
 
--- Indexes for common queries
-CREATE INDEX idx_checkins_user_date ON virtue_checkins(user_id, date);
 CREATE INDEX idx_leaderboard ON virtue_users(world_id, total_points DESC);
 ```
-
-**Why partition by date:**
-- Old data can be archived
-- Queries are typically recent (last 7-30 days)
-- Improves query performance
 
 ### Horizontal Scaling
 
 **Current:** Single agent instance.
 
-**Future:** Multiple agent instances, shared database.
-
-**Challenges:**
-1. Cache invalidation (user data cached in-memory)
-2. Cooldown synchronization (distributed rate limiting)
-3. Leaderboard consistency (eventual consistency acceptable)
+**Future challenges:**
+1. Cache invalidation (user data in-memory)
+2. Cooldown synchronization
+3. Leaderboard consistency
 
 **Solutions:**
-1. Use Redis for shared cache layer
-2. Use distributed lock (Redis or database)
-3. Update leaderboard async (doesn't need to be instant)
+1. Redis for shared cache
+2. Distributed locks
+3. Eventual consistency for leaderboards
+
+---
+
+## Code Organization
+
+### Services (8)
+
+| Service | Responsibility |
+|---------|----------------|
+| VirtueService | Core tracking, streaks, badges, DNA |
+| NotificationService | DM reminders, milestone alerts |
+| SeasonalEventsService | Event activation, multipliers |
+| VirtueSynergyService | Combo detection, bonuses |
+| VirtueChallengeService | Quest tracking, rewards |
+| MentorshipService | Mentor-mentee relationships |
+| HistoricalComparisonService | Legend comparisons |
+| VirtueRemixService | AI suggestions |
+
+**Why 8 services?**
+- Single responsibility principle
+- Testable in isolation
+- Can be disabled/replaced individually
+
+### Actions (19)
+
+Split into categories for clarity:
+- Core tracking (6)
+- Settings (3)
+- Social (5)
+- Data (2)
+- Admin (3)
+
+**Why 19 actions vs 1 mega-action?**
+- Clear intent per command
+- Better validation
+- Easier to add/remove features
+
+### Evaluators (1)
+
+Only `virtueObserver` – runs on every message.
+
+**Why only 1?**
+- Evaluators are expensive (run on every message)
+- Single evaluator handles all detection
+- Rule-based matching is fast
+
+### Task Workers (3)
+
+| Worker | Interval | Purpose |
+|--------|----------|---------|
+| RuleRefinement | 24h | LLM improves detection |
+| CommunityReport | 7d | Weekly insights |
+| DailyReminder | per-user | Opt-in notifications |
 
 ---
 
 ## Summary
 
-**Key Principles:**
+### Design Trade-offs
 
-1. **Performance First:** Rule-based detection for 99% of messages, LLM for 1% refinement
-2. **Cache for Speed:** Simple cache-based storage for current scale, database-ready for future
-3. **Anti-Gaming:** Cooldowns, duplicate detection, self-referential filtering
-4. **Balanced Economy:** Point values and caps prevent inflation, keep new users competitive
-5. **Privacy by Design:** Minimal data storage, full GDPR compliance, opt-outs respected
-6. **Scalability Path:** Clear migration path to database when needed
-
-**Design Trade-offs:**
-
-| Decision | Pro | Con | When to Revisit |
-|----------|-----|-----|-----------------|
+| Decision | Pro | Con | Revisit When |
+|----------|-----|-----|--------------|
 | Cache storage | Simple, fast | Limited scale | >5K users |
-| Rule-based detection | Fast, cheap | Less accurate | Detection quality drops |
-| Cooldowns | Prevents gaming | Might miss legitimate | User complaints |
-| Cap streak bonus | Fair economy | Demotivates long-term users | User churn >30 days |
+| Rule-based detection | Fast, cheap | Less accurate | Quality drops |
+| Per-user cooldown | Anti-gaming | Might miss legitimate | Complaints |
+| Streak cap +50 | Fair economy | Demotivates veterans | Churn >30 days |
 
----
+### Key Principles
 
-**Further Reading:**
-- See inline code comments for implementation details
-- See `README.md` for user documentation
-- See `ALL_PHASES_COMPLETE.md` for feature list
-
+1. **Performance First** – Rule-based detection, LLM only for refinement
+2. **Privacy by Design** – Minimal data, full opt-outs
+3. **Fair Economy** – Caps and curves prevent inflation
+4. **Self-Improving** – AI learns better patterns over time
+5. **Scalability Path** – Clear migration when needed
